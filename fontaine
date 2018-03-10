@@ -1,0 +1,467 @@
+#!/bin/bash
+# Shell multi environment sourcing interface
+
+##
+# main function
+#
+_main () {
+        # variables
+        local debug=false
+
+        # constantes
+        local -r fontaine_directory="$(dirname $(readlink -f $0))"
+        local -r config_file="${HOME}/.fontainerc"
+        local -r quit_error_code=255
+
+        # optionnal arguments
+        while getopts ":hdql" option
+        do
+                case $option in
+                        h) # display help
+                                _help_arguments
+                                echo
+                                _help_directions
+                                return 0
+                                ;;
+                        d) # debug mode
+                                debug=true
+                                ;;
+                        q) # quit all fontaine instances
+                                _ask_to_quit
+                                return 0
+                                ;;
+                        l) # list available sources
+                                _list_available
+                                return 0
+                                ;;
+                esac
+        done
+
+        shift $((OPTIND - 1))
+
+        # any argument beyond the optionnal arguments are springs, so load them
+        local spring_name_list="$@"
+        if [[ -n $spring_name_list ]]
+        then
+                _load $spring_name_list
+                return 0
+        fi
+
+        # no argument, just list
+        _list_loaded
+}
+
+##
+# get the available scrpits
+#
+# springs is passepd by scope
+_get_springs () {
+        local line
+        local name
+
+        if ! [[ -s $config_file ]]
+        then
+                touch $config_file
+                _error "Le fichier de configuration est vide"
+                exit 1
+        fi
+
+        local spring
+        while read line
+        do
+                name=$(echo $line | cut -f1 -d ';')
+                _debug "Source trouvée : ${name}"
+
+                # because Bash doesn't have nested arrays, we have to use text concatenation
+                spring="$(echo $line | tr ';' ' ')"
+                springs+=("$spring")
+        done <$config_file
+}
+
+##
+# list the available sources
+#
+_list_available () {
+        # get the springs
+        # `springs` has to be a simple array for Bash 3 compatibility
+        declare -a springs
+        _get_springs
+
+        local -r pattern="%-20s %-50s %-8s\n"
+        printf "$pattern" "Nom" "Script" "Shell"
+        printf '%80s\n' | tr ' ' -
+
+        local spring
+        local name
+        local file
+        local shell
+        for spring in "${springs[@]}"
+        do
+                read -r name file shell <<<"${spring}"
+                file="${file/$HOME/~}"
+                printf "${pattern}" "${name}" "${file}" "${shell}"
+        done
+}
+
+##
+# list the loaded scripts
+#
+_list_loaded () {
+        # check if there are no springs loaded
+        if [[ -z $FONTAINE_LOADED ]]
+        then
+                _debug "La variable 'FONTAINE_LOADED' est vide"
+                echo "Pas de script chargé"
+                return
+        fi
+
+        # otherwise, show them
+        _debug "FONTAINE_LOADED : '${FONTAINE_LOADED}'"
+
+        echo "Scripts chargés"
+        printf '%80s\n' | tr ' ' -
+
+        local script
+        for script in ${FONTAINE_LOADED//:/ }
+        do
+                echo "$script"
+        done
+}
+
+##
+# get the shell name
+#
+_get_shell () {
+        # we use the parent PID to get the name of the parent shell which launched fontaine
+        local parent_shell=$(readlink /proc/$PPID/exe)
+        local shell_name=${parent_shell##*/}
+        _debug "Nom du shell actuel : '${shell_name}'"
+        echo $shell_name
+}
+
+##
+# load a script
+#
+# $@ string list of scripts to load
+_load () {
+        local spring_name_list="$@"
+        local parent_shell=$(_get_shell)
+        local requested_shell
+
+        # get the springs
+        # `springs` has to be a simple array for Bash 3 compatibility
+        declare -a springs
+        _get_springs
+
+        FONTAINE_SOURCEFILES=""
+        local spring_name
+        for spring_name in $spring_name_list
+        do
+                _debug "Préparations pour '${spring_name}'"
+
+                local spring_name
+                local spring_shell
+                local spring_file
+
+                # check if the requested spring is valid
+                # and fill `spring_shell` and `spring_file`
+                _check_spring_name $spring_name
+
+                # run other tests
+                # we pass `spring` via scope (it's non trivial to pass Bash arrays as arguments)
+                _check_spring_path $spring_file
+                _check_spring_shell $spring_shell
+
+                if [[ -n $spring_shell ]]
+                then
+                        if [[ -n $requested_shell ]] &&
+                                [[ $spring_shell != $requested_shell ]]
+                        then
+                                _error "Les sources demandées nécessitent des shells différents"
+                                exit 1
+                        fi
+
+                        requested_shell=$spring_shell
+                fi
+
+                # export vars for the forked shell instance
+                export FONTAINE_LOADED=$FONTAINE_LOADED:$spring_name
+                export FONTAINE_SOURCEFILES="$FONTAINE_SOURCEFILES $spring_file"
+        done
+
+        # assign current shell if none specified
+        if [[ $requested_shell == "" ]]
+        then
+                _debug "Utilisation du shell courant"
+                requested_shell=$parent_shell
+        fi
+
+        # check shell
+        _check_shell_ability $requested_shell
+
+        # trap the quit signal
+        trap _quit USR1
+
+        # assign the current shell if no specifies, but we have checked if the shell is valid
+        # in `_check_spring_shell`
+        # create a new shell on the top of the current one
+        _debug "Ouverture d'un nouveau shell"
+        eval "$requested_shell"
+
+        trap - USR1
+}
+
+##
+# check if the target shell can source the fountaine source file
+#
+# $1 shell name
+_check_shell_ability () {
+        local shell_name=$1
+        local shell_rc_file="$HOME/.${shell_name}rc"
+
+        # we check if the line indicating to source the fountaine source file is present
+        if ! /bin/grep "\$FONTAINE_SOURCEFILES" $shell_rc_file >/dev/null 2>&1
+        then
+                _error "Le fichier '${shell_rc_file}' n'a pas été configuré pour fontaine"
+                echo
+                _help_directions
+
+                exit 1
+        fi
+
+        _debug "Le fichier '${shell_rc_file}' a été configuré pour fontaine"
+}
+
+##
+# check if a spring is valid
+#
+# $1 spring name requested
+_check_spring_name () {
+        local spring_name_requested=$1
+        local spring
+        local name
+        local file
+        local shell
+
+        for spring in "${springs[@]}"
+        do
+                # parse the line
+                read -r name file shell <<<"${spring}"
+
+                if [[ $name == $spring_name_requested ]]
+                then
+                        # convert tilde with home directory
+                        file=${file/#\~/$HOME}
+
+                        _debug "La source est valide"
+                        _debug "Nom de la source : '${name}'"
+                        _debug "Chemin du fichier à sourcer : '${file}'"
+                        _debug "Shell à utiliser : '${shell}'"
+
+                        spring_name=$name
+                        spring_file=$file
+                        spring_shell=$shell
+
+                        return
+                fi
+        done
+
+        _error "La source '$spring_name_requested' est invalide"
+        exit 1
+}
+
+##
+# check if the source file of the spring exists
+#
+# $1 spring file path
+_check_spring_path () {
+        local spring_path=$1
+
+        if ! [[ -f $spring_path ]]
+        then
+                _error "Le fichier source '${spring_path}' n'existe pas"
+                exit 1
+        fi
+
+        _debug "Le fichier source a été trouvé"
+}
+
+##
+# check if the shell requested is valid
+#
+# $1 spring shell
+_check_spring_shell () {
+        local spring_shell=$1
+
+        # if no shell specified
+        if [[ -z $spring_shell ]]
+        then
+                _debug "Aucun shell n'est demandé"
+                return
+        fi
+
+        # check among official shells of the system
+        local shell_path
+        local shell_name
+        while read shell_path
+        do
+                shell_name="${shell_path##*/}"
+                if [[ $spring_shell == $shell_name ]]
+                then
+                        _debug "Le shell demandé est valide"
+                        return
+                fi
+        done </etc/shells
+
+        # check if the shell is a dangerous command
+        if [[ $spring_shell == *rm* ]] || [[ $spring_shell == *del* ]]
+        then
+                _error "Le shell demandé '${spring_shell}' a été identifié comme une commande dangereuse"
+                exit 1
+        fi
+
+        # check if the shell is a valid command
+        # `command` does not execute it, so it's safe
+        if command -v $spring_shell >/dev/null 2>&1
+        then
+                # request confirmation
+                _warning "Le shell que vous avez demandé n'a pas été reconnu comme un shell du système"
+                _warning "Vous allez utiliser la commande '${spring_shell}' comme shell pour la source"
+                _warning "Vérifiez que cette commande n'est pas dangereuse"
+                echo -n "Continuer ? [o/N] "
+
+                read local confirmation
+
+                if [[ $confirmation == "o" ]]
+                then
+                        _debug "Le shell demandé n'est pas valide mais a été autorisé"
+                        return
+                fi
+
+                exit 0
+        fi
+
+        # nothing worked so far...
+        _error "Le shell demandé '${spring_shell}' n'est pas valide"
+}
+
+##
+# quit this instance of fontaine and ask previous instance to quit too
+#
+_quit () {
+        _debug "Fin de la fontaine"
+        _ask_to_quit
+        exit 0
+}
+
+##
+# ask the previous instance to quit
+#
+# we have to kill the shell first, as it seems to retain signals
+# then, we kill the fontaine instance
+_ask_to_quit () {
+        # get the PID of fontaine
+        fontaine_father_pid=$(pgrep -f $0 | tail -n3 | head -n1)
+        _debug "PID du fontaine père : $fontaine_father_pid"
+
+        # get the PID of the shell spawned by fontaine
+        shell_father_pid=$(pgrep -P $fontaine_father_pid)
+        _debug "PID du shell père : $shell_father_pid"
+
+        # kill both of them, the shell first
+        kill -USR1 $shell_father_pid >/dev/null 2>&1
+        kill -USR1 $fontaine_father_pid >/dev/null 1>&1
+}
+
+##
+# help for arguments
+#
+_help_arguments () {
+        cat << EOF
+fontaine [-h] [-d] [-q] [[-l] | [SOURCE]]
+
+Source un fichier dans un nouveau shell depuis une liste.
+
+Sans arguments, affiche la liste des sources activées.
+
+Arguments :
+    -h
+        Affiche ce message d'aide et quitte.
+    -d
+        Mode débug, augmente la verbosité.
+    -q
+        Ferme toutes les instances de fontaine.
+    -l
+        Liste les sources disponibles.
+    SOURCE
+        Nom de la source à charger.
+EOF
+}
+##
+# help for directions to configure shellrc file
+#
+_help_directions () {
+        cat << EOF
+Fontaine utilise le fichier de configuration du shell pour sourcer le fichier
+désiré (c'est la façon la plus universelle de procéder pour tous les shells).
+
+Exemple de code à ajouter au fichier de configuration pour les shells de type
+Bourne Shell (.bashrc, .zshrc, .kshrc...) :
+
+# configuration pour fontaine
+# vérifier qu'il y a un fichier à sourcer
+if [[ -n \$FONTAINE_SOURCEFILES ]]
+then
+        for fontaine_sourcefile in \$FONTAINE_SOURCEFILES
+        do
+                # vérifier que le fichier à sourcer existe
+                if ! [[ -f \$fontaine_sourcefile ]]
+                then
+                        echo "Fichier à sourcer non trouvé : '\$fontaine_sourcefile'"
+                        exit 1
+                fi
+
+                # le sourcer
+                source \$fontaine_sourcefile
+        done
+
+        # supprimer la variable
+        unset FONTAINE_SOURCEFILES
+fi
+EOF
+
+}
+
+
+##
+# Print error
+#
+_error () {
+        >&2 printf "$(tput sgr 0; tput bold; tput setaf 1)ERREUR %s$(tput sgr 0)\n" "$@"
+}
+
+##
+# Print warning
+#
+_warning () {
+        >&2 printf "$(tput sgr 0; tput setaf 3)ATTENTION %s$(tput sgr 0)\n" "$@"
+}
+
+##
+# Print normal output
+#
+_info () {
+        >&1 printf "%s\n" "$@"
+}
+
+##
+# Print debug
+#
+_debug () {
+        if $debug
+        then
+                >&2 printf "$(tput sgr 0; tput setaf 6)DÉBUG %s$(tput sgr 0)\n" "$@"
+        fi
+}
+
+_main "$@"
